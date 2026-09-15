@@ -1,0 +1,93 @@
+# Build the golang.org/x/text module zip and run the project's own test suite.
+#
+# Upstream golang.org/x/text has no GitHub Actions CI (it is tested by the Go
+# project's own TryBots/LUCI builders), so this workflow is written from
+# scratch. It runs exactly what the project runs: `go build ./...` and
+# `go test ./...` with the toolchain declared in go.mod (go 1.25.0).
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go package pattern to test (defaults to ./...)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  MODULE_PATH: golang.org/x/text
+  MODULE_VERSION: v0.35.0
+  # go.mod declares `go 1.25.0`. The go1.27-tagged Unicode 17.0.0 tables are all
+  # paired with !go1.27 counterparts, so 1.25 compiles every package completely.
+  GO_VERSION: "1.25"
+
+jobs:
+  module-zip:
+    name: module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Build the module-zip helper in its own module outside the checkout
+        run: |
+          set -eux
+          HELPER="$(mktemp -d)"
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/main.go"
+          cd "$HELPER"
+          go mod init sealhelper
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      - name: Drop CI-only files from the module tree
+        run: |
+          set -eux
+          rm -rf "$GITHUB_WORKSPACE/.github"
+
+      - name: Create the module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/create_mod" \
+            "$MODULE_PATH" "$MODULE_VERSION" \
+            "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/$MODULE_VERSION.zip"
+          echo "entries: $(unzip -l "$RUNNER_TEMP/out/$MODULE_VERSION.zip" | tail -1)"
+          unzip -l "$RUNNER_TEMP/out/$MODULE_VERSION.zip" | grep -E '/\.git' || echo "no .git/.github entries in zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.35.0.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ${{ inputs.test-filter || './...' }}
